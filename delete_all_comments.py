@@ -44,7 +44,7 @@ class VkDeleter:
 
     async def delete_comment(self, owner_id, comment_id, link, count):
         try:
-            await self.api.wall.deleteComment(owner_id=owner_id, comment_id=comment_id)
+            await self.api.wall.deleteComment(owner_id=owner_id, comment_id=comment_id, v="5.131")
             self.log(f"Успешно удалено {link}", Fore.GREEN, count)
             self.success_count += 1
         except VkAPIError as err:
