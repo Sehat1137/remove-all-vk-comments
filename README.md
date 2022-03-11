@@ -16,6 +16,6 @@ https://oauth.vk.com/authorize?client_id=6061680&display=page&scope=wall&respons
 
 
 ## Установка и запуск
-1. Для корректной работы необходимо наличие python 3.x и pip
+1. Для корректной работы необходимо наличие python 3.7.x и выше, pip для интерпретатора
 2. Устанавливаете зависимости проекта `pip3 install -r requirements.txt`
 3. Запускаете `python3 delete_all_comments.py --token your_token --path path_to_comments_directory`
