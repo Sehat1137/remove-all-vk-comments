@@ -8,7 +8,7 @@ from colorama import Fore, Style
 import aiovk
 from aiovk.exceptions import VkAPIError
 
-from bs4 import BeautifulSoup
+from bs4 import BeautifulSoup 
 
 
 class VkDeleter:
