@@ -3,32 +3,23 @@ import os
 import argparse
 import asyncio
 import sys
+from typing import List, Dict, Tuple, Optional
 from bs4 import BeautifulSoup
 from aiovk import TokenSession, API
-from colorama import Fore, Style, init
+from colorama import Fore, init
 
 init(autoreset=True)
 
-async def delete_comments(token, comments_path, auto_confirm=False):
-    """Удаляет все комментарии используя VK API"""
+
+class VkCommentDeleter:
+    """Класс для удаления комментариев ВКонтакте с использованием DI"""
     
-    session = TokenSession(access_token=token)
-    session.API_VERSION = '5.131'  # принудительно устанавливаем актуальную версию (2025-08-05)
-    api = API(session)
-    
-    print(f"{Fore.CYAN}🔍 Анализируем комментарии в папке: {comments_path}")
-    
-    all_links = []
-    files_count = 0
-    
-    for filename in os.listdir(comments_path):
-        filepath = os.path.join(comments_path, filename)
-        if not os.path.isfile(filepath) or not filename.endswith('.html'):
-            continue
-            
-        files_count += 1
-        print(f"{Fore.YELLOW}📄 Обрабатываем файл: {filename}")
+    def __init__(self, api: API):
+        self.api = api
+        self.semaphore = asyncio.Semaphore(3)  # Ограничение 3 RPS
         
+    async def _parse_html_file(self, filepath: str) -> List[str]:
+        """Парсит HTML файл и извлекает ссылки на комментарии"""
         try:
             with open(filepath, "r", encoding="windows-1251") as file:
                 html_content = file.read()
@@ -41,90 +32,70 @@ async def delete_comments(token, comments_path, auto_confirm=False):
                     with open(filepath, "r", encoding="ISO-8859-1") as file:
                         html_content = file.read()
                 except Exception as e:
-                    print(f"{Fore.RED}❌ Ошибка чтения файла {filename}: {e}")
-                    continue
+                    print(f"{Fore.RED}❌ Ошибка чтения файла {filepath}: {e}")
+                    return []
             except Exception as e:
-                print(f"{Fore.RED}❌ Ошибка чтения файла {filename}: {e}")
-                continue
+                print(f"{Fore.RED}❌ Ошибка чтения файла {filepath}: {e}")
+                return []
         
         soup = BeautifulSoup(html_content, "lxml")
-        
         comment_links = []
+        
         for a in soup.select("div.item div.item__main a"):
             href = a.get('href', '')
             if 'wall' in href and 'reply=' in href:
                 comment_links.append(href)
+                
+        return comment_links
+
+    def _parse_comment_links(self, links: List[str]) -> List[Dict]:
+        """Парсит ссылки на комментарии и извлекает идентификаторы"""
+        parsed_data = []
         
-        all_links.extend(comment_links)
-        print(f"  Найдено комментариев: {len(comment_links)}")
+        for link in links:
+            wall_match = re.search(r"wall(-?\d+)_(\d+)", link)
+            if not wall_match:
+                continue
+                
+            owner_id = int(wall_match.group(1))
+            post_id = int(wall_match.group(2))
 
-    parsed_data = []
-    for link in all_links:
-        wall_match = re.search(r"wall(-?\d+)_(\d+)", link)
-        if not wall_match:
-            continue
+            reply_match = re.search(r"reply=(\d+)", link)
+            if not reply_match:
+                continue
+                
+            comment_id = int(reply_match.group(1))
+
+            parsed_data.append({
+                "link": link,
+                "owner_id": owner_id,
+                "post_id": post_id,
+                "comment_id": comment_id,
+            })
             
-        owner_id = int(wall_match.group(1))
-        post_id = int(wall_match.group(2))
+        return parsed_data
 
-        reply_match = re.search(r"reply=(\d+)", link)
-        if not reply_match:
-            continue
-            
-        comment_id = int(reply_match.group(1))
-
-        parsed_data.append({
-            "link": link,
-            "owner_id": owner_id,
-            "post_id": post_id,
-            "comment_id": comment_id,
-        })
-
-    total_comments = len(parsed_data)
-    print(f"\n{Fore.CYAN}{'-'*60}")
-    print(f"📊 СТАТИСТИКА:")
-    print(f"Обработано файлов: {files_count}")
-    print(f"Всего найдено комментариев: {total_comments}")
-    print(f"{'-'*60}")
-
-    if total_comments == 0:
-        print(f"{Fore.YELLOW}⚠️  Комментарии для удаления не найдены")
-        return
-
-    print(f"\n{Fore.RED}⚠️  ВНИМАНИЕ! Вы собираетесь удалить {total_comments} комментариев.")
-    print(f"{Fore.RED}Это действие необратимо!")
-    
-    if not auto_confirm:
-        confirmation = input(f"\n{Fore.YELLOW}Продолжить? (yes/no): ").lower().strip()
-        if confirmation not in ['yes', 'y', 'да']:
-            print(f"{Fore.CYAN}❌ Операция отменена пользователем")
-            return
-    else:
-        print(f"\n{Fore.GREEN}🤖 Автоматическое подтверждение активировано - продолжаем удаление")
-
-    print(f"\n{Fore.GREEN}🚀 Начинаем удаление комментариев с автоматическими повторными попытками...")
-    
-    deleted_count = 0
-    permanently_failed = []
-    max_retries = 3
-    retry_delay = 2.0
-    
-    def is_retryable_error(error_msg):
-        retryable_errors = [
-            "Too many requests per second",
-            "Internal server error",
-            "Service temporarily unavailable",
-            "Connection error"
-        ]
-        return any(err in error_msg for err in retryable_errors)
-    
-    async def delete_comment_with_retry(comment, index, total):
+    async def _delete_comment_with_retry(self, comment: Dict, index: int, total: int) -> bool:
+        """Удаляет комментарий с повторными попытками при ошибках"""
+        max_retries = 3
+        retry_delay = 2.0
+        
+        def is_retryable_error(error_msg: str) -> bool:
+            retryable_errors = [
+                "Too many requests per second",
+                "Internal server error",
+                "Service temporarily unavailable",
+                "Connection error"
+            ]
+            return any(err in error_msg for err in retryable_errors)
+        
         for attempt in range(max_retries + 1):
             try:
-                result = await api.wall.deleteComment(
-                    owner_id=comment['owner_id'],
-                    comment_id=comment['comment_id']
-                )
+                async with self.semaphore:
+                    result = await self.api.wall.deleteComment(
+                        owner_id=comment['owner_id'],
+                        comment_id=comment['comment_id']
+                    )
                 
                 if result == 1:
                     print(f"{Fore.GREEN}✅ [{index}/{total}] Удален комментарий {comment['comment_id']}")
@@ -156,57 +127,149 @@ async def delete_comments(token, comments_path, auto_confirm=False):
                     return False
         
         return False
-    
-    # Основной цикл удаления
-    for i, comment in enumerate(parsed_data, 1):
-        success = await delete_comment_with_retry(comment, i, total_comments)
-        if success:
-            deleted_count += 1
-        else:
-            permanently_failed.append(comment)
-        
-        if i % 5 == 0:
-            await asyncio.sleep(2.0)  # Больше задержка каждые 5 запросов
-        else:
-            await asyncio.sleep(0.5)  # Увеличенная базовая задержка
-    
-    failed_count = len(permanently_failed)
 
-    print(f"\n{Fore.CYAN}{'-'*60}")
-    print(f"📊 РЕЗУЛЬТАТ:")
-    print(f"{Fore.GREEN}✅ Успешно удалено: {deleted_count}")
-    print(f"{Fore.RED}❌ Не удалось удалить: {failed_count}")
-    print(f"📈 Процент успеха: {(deleted_count/total_comments)*100:.1f}%")
-    
-    # Показываем детали неудачных комментариев
-    if permanently_failed:
-        print(f"\n{Fore.YELLOW}📋 АНАЛИЗ НЕУДАЧНЫХ УДАЛЕНИЙ:")
-        access_denied = 0
-        private_profiles = 0
-        other_errors = 0
+    async def delete_comments(self, comments_path: str, auto_confirm: bool = False) -> Tuple[int, int, int]:
+        """Удаляет все комментарии используя VK API"""
+        print(f"{Fore.CYAN}🔍 Анализируем комментарии в папке: {comments_path}")
         
-        # Подсчитываем типы ошибок для отчета
-        print(f"{Fore.YELLOW}💾 Сохранено {len(permanently_failed)} неудачных ссылок для дальнейшего анализа")
-        print(f"   - Примеры неудачных ссылок:")
-        for i, failed in enumerate(permanently_failed[:5]):  # Показываем первые 5
-            print(f"     {i+1}. {failed['link']}")
-        if len(permanently_failed) > 5:
-            print(f"     ... и еще {len(permanently_failed) - 5} ссылок")
+        all_links = []
+        files_count = 0
+        
+        for filename in os.listdir(comments_path):
+            filepath = os.path.join(comments_path, filename)
+            if not os.path.isfile(filepath) or not filename.endswith('.html'):
+                continue
+                
+            files_count += 1
+            print(f"{Fore.YELLOW}📄 Обрабатываем файл: {filename}")
+            
+            links = await self._parse_html_file(filepath)
+            all_links.extend(links)
+            print(f"  Найдено комментариев: {len(links)}")
+
+        parsed_data = self._parse_comment_links(all_links)
+        total_comments = len(parsed_data)
+        
+        print(f"\n{Fore.CYAN}{'-'*60}")
+        print("📊 СТАТИСТИКА:")
+        print(f"Обработано файлов: {files_count}")
+        print(f"Всего найдено комментариев: {total_comments}")
+        print(f"{'-'*60}")
+
+        if total_comments == 0:
+            print(f"{Fore.YELLOW}⚠️  Комментарии для удаления не найдены")
+            return 0, 0, 0
+
+        print(f"\n{Fore.RED}⚠️  ВНИМАНИЕ! Вы собираетесь удалить {total_comments} комментариев.")
+        print(f"{Fore.RED}Это действие необратимо!")
+        
+        if not auto_confirm:
+            confirmation = input(f"\n{Fore.YELLOW}Продолжить? (yes/no): ").lower().strip()
+            if confirmation not in ['yes', 'y', 'да']:
+                print(f"{Fore.CYAN}❌ Операция отменена пользователем")
+                return 0, 0, 0
+        else:
+            print(f"\n{Fore.GREEN}🤖 Автоматическое подтверждение активировано - продолжаем удаление")
+
+        print(f"\n{Fore.GREEN}🚀 Начинаем удаление комментариев с автоматическими повторными попытками...")
+        
+        deleted_count = 0
+        permanently_failed = []
+        
+        # Основной цикл удаления
+        for i, comment in enumerate(parsed_data, 1):
+            success = await self._delete_comment_with_retry(comment, i, total_comments)
+            if success:
+                deleted_count += 1
+            else:
+                permanently_failed.append(comment)
+        
+        failed_count = len(permanently_failed)
+
+        print(f"\n{Fore.CYAN}{'-'*60}")
+        print("📊 РЕЗУЛЬТАТ:")
+        print(f"{Fore.GREEN}✅ Успешно удалено: {deleted_count}")
+        print(f"{Fore.RED}❌ Не удалось удалить: {failed_count}")
+        print(f"📈 Процент успеха: {(deleted_count/total_comments)*100:.1f}%")
+        
+        # Показываем детали неудачных комментариев
+        if permanently_failed:
+            print(f"\n{Fore.YELLOW}📋 АНАЛИЗ НЕУДАЧНЫХ УДАЛЕНИЙ:")
+            
+            # Подсчитываем типы ошибок для отчета
+            print(f"{Fore.YELLOW}💾 Сохранено {len(permanently_failed)} неудачных ссылок для дальнейшего анализа")
+            print("   - Примеры неудачных ссылок:")
+            for i, failed in enumerate(permanently_failed[:5]):  # Показываем первые 5
+                print(f"     {i+1}. {failed['link']}")
+            if len(permanently_failed) > 5:
+                print(f"     ... и еще {len(permanently_failed) - 5} ссылок")
     
-    print(f"\n{Fore.GREEN}🎯 ИТОГОВАЯ СТАТИСТИКА:")
-    print(f"   Обработано файлов: {files_count}")
-    print(f"   Найдено комментариев: {total_comments}")
-    print(f"   Успешно удалено: {deleted_count}")
-    print(f"   Не удалось удалить: {failed_count}")
-    print(f"   Итоговый процент успеха: {(deleted_count/total_comments)*100:.1f}%")
-    print(f"{'-'*60}")
+        print(f"\n{Fore.GREEN}🎯 ИТОГОВАЯ СТАТИСТИКА:")
+        print(f"   Обработано файлов: {files_count}")
+        print(f"   Найдено комментариев: {total_comments}")
+        print(f"   Успешно удалено: {deleted_count}")
+        print(f"   Не удалось удалить: {failed_count}")
+        print(f"   Итоговый процент успеха: {(deleted_count/total_comments)*100:.1f}%")
+        print(f"{'-'*60}")
+        
+        return deleted_count, failed_count, total_comments
+
+
+async def run_multiple_iterations(
+    deleter: VkCommentDeleter, 
+    comments_path: str, 
+    max_iterations: int, 
+    auto_confirm: bool
+) -> None:
+    """Запускает несколько итераций удаления комментариев"""
+    print(f"\n{Fore.CYAN}🔄 Режим множественных итераций активирован (макс. {max_iterations} итераций)")
+    print(f"🤖 Автоподтверждение: {'включено' if auto_confirm else 'отключено'}")
     
-    try:
-        await session.close()
-    except Exception:
-        pass
+    total_deleted_all_iterations = 0
+    total_comments = 0
+    iteration = 1
     
-    return deleted_count, failed_count, total_comments
+    while iteration <= max_iterations:
+        print(f"\n{Fore.MAGENTA}{'='*70}")
+        print(f"🔄 ИТЕРАЦИЯ {iteration}/{max_iterations}")
+        print(f"{'='*70}")
+        
+        # Для первой итерации спрашиваем подтверждение, для остальных - автоматически
+        auto_confirm_current = auto_confirm or (iteration > 1)
+        
+        deleted, failed, total = await deleter.delete_comments(
+            comments_path, 
+            auto_confirm=auto_confirm_current
+        )
+        
+        total_deleted_all_iterations += deleted
+        total_comments = total
+        
+        print(f"\n{Fore.CYAN}📊 РЕЗУЛЬТАТ ИТЕРАЦИИ {iteration}:")
+        print(f"   Удалено в этой итерации: {deleted}")
+        print(f"   Не удалось в этой итерации: {failed}")
+        print(f"   Общий прогресс: {total_deleted_all_iterations}/{total_comments} ({(total_deleted_all_iterations/total_comments)*100:.1f}%)")
+        
+        if deleted < 5:
+            print(f"\n{Fore.GREEN}✅ Достигнут порог стабилизации (удалено < 5 комментариев)")
+            print("🏁 Завершаем итерации досрочно")
+            break
+            
+        if iteration < max_iterations:
+            print(f"\n{Fore.YELLOW}⏳ Пауза перед следующей итерацией (30 секунд)...")
+            await asyncio.sleep(30)
+        
+        iteration += 1
+    
+    print(f"\n{Fore.GREEN}{'🎉'*70}")
+    print("🏆 ФИНАЛЬНЫЙ РЕЗУЛЬТАТ ВСЕХ ИТЕРАЦИЙ:")
+    print(f"   Выполнено итераций: {iteration if iteration <= max_iterations else max_iterations}")
+    print(f"   Общее количество комментариев: {total_comments}")
+    print(f"   Всего удалено: {total_deleted_all_iterations}")
+    print(f"   Остается неудаленных: {total_comments - total_deleted_all_iterations}")
+    print(f"   Итоговый процент успеха: {(total_deleted_all_iterations/total_comments)*100:.1f}%")
+    print(f"{'🎉'*70}")
+
 
 def main():
     parser = argparse.ArgumentParser(description="Удаление комментариев ВКонтакте")
@@ -244,65 +307,32 @@ def main():
         print(f"{Fore.RED}❌ Указанный путь не является папкой: {args.path}")
         sys.exit(1)
     
-    async def run_multiple_iterations():
-        # Многократные итерации для гарантированного результата
-        print(f"\n{Fore.CYAN}🔄 Режим множественных итераций активирован (макс. {args.max_iterations} итераций)")
-        print(f"🤖 Автоподтверждение: {'включено' if args.auto_confirm else 'отключено'}")
-        
-        total_deleted_all_iterations = 0
-        total_comments = 0
-        iteration = 1
-        
-        while iteration <= args.max_iterations:
-            print(f"\n{Fore.MAGENTA}{'='*70}")
-            print(f"🔄 ИТЕРАЦИЯ {iteration}/{args.max_iterations}")
-            print(f"{'='*70}")
-            
-            # Для первой итерации спрашиваем подтверждение, для остальных - автоматически
-            auto_confirm_current = args.auto_confirm or (iteration > 1)
-            
-            deleted, failed, total = await delete_comments(
-                args.token, 
-                args.path, 
-                auto_confirm=auto_confirm_current
-            )
-            
-            total_deleted_all_iterations += deleted
-            total_comments = total
-            
-            print(f"\n{Fore.CYAN}📊 РЕЗУЛЬТАТ ИТЕРАЦИИ {iteration}:")
-            print(f"   Удалено в этой итерации: {deleted}")
-            print(f"   Не удалось в этой итерации: {failed}")
-            print(f"   Общий прогресс: {total_deleted_all_iterations}/{total_comments} ({(total_deleted_all_iterations/total_comments)*100:.1f}%)")
-            
-            if deleted < 5:
-                print(f"\n{Fore.GREEN}✅ Достигнут порог стабилизации (удалено < 5 комментариев)")
-                print(f"🏁 Завершаем итерации досрочно")
-                break
-                
-            if iteration < args.max_iterations:
-                print(f"\n{Fore.YELLOW}⏳ Пауза перед следующей итерацией (30 секунд)...")
-                await asyncio.sleep(30)
-            
-            iteration += 1
-        
-        print(f"\n{Fore.GREEN}{'🎉'*70}")
-        print(f"🏆 ФИНАЛЬНЫЙ РЕЗУЛЬТАТ ВСЕХ ИТЕРАЦИЙ:")
-        print(f"   Выполнено итераций: {iteration if iteration <= args.max_iterations else args.max_iterations}")
-        print(f"   Общее количество комментариев: {total_comments}")
-        print(f"   Всего удалено: {total_deleted_all_iterations}")
-        print(f"   Остается неудаленных: {total_comments - total_deleted_all_iterations}")
-        print(f"   Итоговый процент успеха: {(total_deleted_all_iterations/total_comments)*100:.1f}%")
-        print(f"{'🎉'*70}")
+    # Создаем сессию и API объект один раз
+    session = TokenSession(access_token=args.token)
+    session.API_VERSION = '5.131'
+    api = API(session)
+    
+    # Создаем экземпляр класса для удаления комментариев
+    deleter = VkCommentDeleter(api)
     
     try:
-        asyncio.run(run_multiple_iterations())
+        asyncio.run(run_multiple_iterations(
+            deleter, 
+            args.path, 
+            args.max_iterations, 
+            args.auto_confirm
+        ))
         
     except KeyboardInterrupt:
         print(f"\n{Fore.YELLOW}⚠️  Операция прервана пользователем")
     except Exception as e:
         print(f"\n{Fore.RED}❌ Критическая ошибка: {e}")
         sys.exit(1)
+    finally:
+        try:
+            session.close()
+        except Exception:
+            pass
 
 if __name__ == "__main__":
     main()
