@@ -16,7 +16,7 @@ class VkCommentDeleter:
     
     def __init__(self, api: API):
         self.api = api
-        self.semaphore = asyncio.Semaphore(3)  # Ограничение 3 RPS
+        self.semaphore = asyncio.Semaphore(3)
         
     async def _parse_html_file(self, filepath: str) -> List[str]:
         """Парсит HTML файл и извлекает ссылки на комментарии"""
@@ -176,7 +176,6 @@ class VkCommentDeleter:
         deleted_count = 0
         permanently_failed = []
         
-        # Основной цикл удаления
         for i, comment in enumerate(parsed_data, 1):
             success = await self._delete_comment_with_retry(comment, i, total_comments)
             if success:
@@ -192,14 +191,12 @@ class VkCommentDeleter:
         print(f"{Fore.RED}❌ Не удалось удалить: {failed_count}")
         print(f"📈 Процент успеха: {(deleted_count/total_comments)*100:.1f}%")
         
-        # Показываем детали неудачных комментариев
         if permanently_failed:
             print(f"\n{Fore.YELLOW}📋 АНАЛИЗ НЕУДАЧНЫХ УДАЛЕНИЙ:")
             
-            # Подсчитываем типы ошибок для отчета
             print(f"{Fore.YELLOW}💾 Сохранено {len(permanently_failed)} неудачных ссылок для дальнейшего анализа")
             print("   - Примеры неудачных ссылок:")
-            for i, failed in enumerate(permanently_failed[:5]):  # Показываем первые 5
+            for i, failed in enumerate(permanently_failed[:5]):
                 print(f"     {i+1}. {failed['link']}")
             if len(permanently_failed) > 5:
                 print(f"     ... и еще {len(permanently_failed) - 5} ссылок")
@@ -234,7 +231,6 @@ async def run_multiple_iterations(
         print(f"🔄 ИТЕРАЦИЯ {iteration}/{max_iterations}")
         print(f"{'='*70}")
         
-        # Для первой итерации спрашиваем подтверждение, для остальных - автоматически
         auto_confirm_current = auto_confirm or (iteration > 1)
         
         deleted, failed, total = await deleter.delete_comments(
@@ -307,12 +303,10 @@ def main():
         print(f"{Fore.RED}❌ Указанный путь не является папкой: {args.path}")
         sys.exit(1)
     
-    # Создаем сессию и API объект один раз
     session = TokenSession(access_token=args.token)
     session.API_VERSION = '5.131'
     api = API(session)
     
-    # Создаем экземпляр класса для удаления комментариев
     deleter = VkCommentDeleter(api)
     
     try:
